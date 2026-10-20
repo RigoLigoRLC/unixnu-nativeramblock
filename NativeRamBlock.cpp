@@ -14,6 +14,7 @@
 #include <machine/machine_routines.h>
 #include <vm/vm_kern.h>
 #include <kern/clock.h>
+#include <pexpert/pexpert.h>
 #include "SparseDisk.h"
 #include "PersistOverlay.h"
 
@@ -53,27 +54,21 @@ class NativeRamBlock : public IOBlockStorageDevice {
   RamSparseDisk sparse = {};
   uint8_t seedHash[32] = {};
   persist::Overlay overlay;
-  uint8_t *overlayBits = nullptr, *overlayDirty = nullptr;
+  uint8_t *overlayBits = nullptr, *stage = nullptr;   // stage: kStagePages pages, one write or read run
+  static constexpr uint32_t kStagePages = 32;
   bool storeAttached = false;
-  uint64_t lastSync = 0;
   struct StoreOps {
     bool read(uint64_t b, uint32_t n, void *d) { return native_ufs_store_read(b, n, d); }
     bool write(uint64_t b, uint32_t n, const void *s) { return native_ufs_store_write(b, n, s); }
     bool sync() { return native_ufs_store_sync(); }
   };
   void persistFailed() { overlay.active = false; native_data_persist_state = 5; __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED); }
-  void persistSync() {
-    if (!overlay.active || overlay.readOnly) return;
-    StoreOps ops;
-    if (!overlay.sync(ops)) { persistFailed(); return; }
-    __atomic_fetch_add(&native_data_persist_syncs, 1, __ATOMIC_RELAXED);
-    native_data_persist_present = overlay.present;
-    lastSync = mach_absolute_time();
-  }
 public:
   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
   // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
   // (seedHash) is not affected. Any refusal or error leaves the disk volatile, exactly as without persistence.
+  // sheng-data-persist-reset=1 starts the overlay over (the old pages are dropped, not applied).
+  static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-persist-reset", &v, sizeof v) && v == 1; }
   void attachStore() {
     if (!gate) return;
     IOLockLock(gate);
@@ -93,9 +88,9 @@ public:
         native_data_persist_first_lba = first;
         uint64_t bb = persist::bitmapBlocks(pages);
         overlayBits = static_cast<uint8_t *>(IOMallocZero(bb * persist::kBlock));
-        overlayDirty = static_cast<uint8_t *>(IOMallocZero(bb));
+        stage = static_cast<uint8_t *>(IOMallocZero(kStagePages * persist::kBlock));
         StoreOps ops;
-        persist::Open result = overlayBits && overlayDirty ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, overlayDirty)
+        persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested())
                                                           : persist::Open::Failed;
         native_data_persist_header = static_cast<uint32_t>(overlay.header);
         if (result == persist::Open::Failed) {
@@ -121,7 +116,7 @@ public:
               return true;
             }
           } load = { this };
-          if (overlay.forEachPresent(ops, load)) {
+          if (overlay.forEachPresent(ops, load, stage, kStagePages)) {
             native_data_persist_state = mode == 1 ? 6 : 2;
             native_ram_block_resident_bytes = sparse.resident;
           } else {
@@ -133,7 +128,6 @@ public:
         }
         native_data_persist_present = overlay.present;
         native_data_persist_gpt_after = native_ufs_store_gpt_check();
-        lastSync = mach_absolute_time();
       }
     }
     IOLockUnlock(gate);
@@ -166,7 +160,7 @@ public:
   IOReturn reportWriteProtection(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn doSynchronizeCache() override {
     if (!online) return kIOReturnNotReady;
-    if (gate) { IOLockLock(gate); persistSync(); IOLockUnlock(gate); }
+    // Every changed page is on the medium, with its bitmap bit, before its write completed (PersistOverlay.h): nothing to flush.
     return kIOReturnSuccess;
   }
   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
@@ -247,12 +241,15 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     if(write && actual==bytes && overlay.active && !overlay.readOnly){
       StoreOps store;
       uint64_t firstPage=block*512/4096,lastPage=(block*512+bytes-1)/4096;
-      for(uint64_t i=firstPage;i<=lastPage && overlay.active;++i){
-        if(!sparse.pages[i] || !overlay.writePage(store,i,sparse.pages[i]))persistFailed();
-        else __atomic_fetch_add(&native_data_persist_writes,1,__ATOMIC_RELAXED);
+      for(uint64_t i=firstPage;i<=lastPage && overlay.active;){
+        uint32_t n=0;
+        while(n<kStagePages && i+n<=lastPage && sparse.pages[i+n]){memcpy(stage+(uint64_t)n*persist::kBlock,sparse.pages[i+n],persist::kBlock);++n;}
+        if(!n || !overlay.writeRun(store,i,n,stage)){persistFailed();break;}
+        __atomic_fetch_add(&native_data_persist_writes,n,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_data_persist_syncs,1,__ATOMIC_RELAXED);   // one run = one durable commit
+        native_data_persist_present=overlay.present;
+        i+=n;
       }
-      uint64_t interval=0;clock_interval_to_absolutetime_interval(2,NSEC_PER_SEC,&interval);
-      if(overlay.anyDirty && mach_absolute_time()-lastSync>interval)persistSync();
     }
     if(write)__atomic_fetch_add(&native_ram_block_writes,1,__ATOMIC_RELAXED);
     else __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
@@ -280,7 +277,7 @@ void NativeRamBlock::stop(IOService *provider)
 void NativeRamBlock::free()
 {
   if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks(sparse.bytes / 4096) * persist::kBlock); overlayBits = nullptr; }
-  if (overlayDirty) { IOFree(overlayDirty, persist::bitmapBlocks(sparse.bytes / 4096)); overlayDirty = nullptr; }
+  if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
   if (gate) { IOLockFree(gate); gate = nullptr; }
   if(sparse.pages){
     for(uint64_t i=0;i<sparse.bytes/4096;++i)if(sparse.pages[i])IOFree(sparse.pages[i],4096);

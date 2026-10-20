@@ -7,13 +7,15 @@
 //   block 0                 header: "SHNGDATA", version 1, header bytes 64, page count, SHA-256 of the seed, generation (32 bit), crc32
 //   blocks 1 .. B           presence bitmap, one bit per page of the disk, B = ceil(pages / 32768)
 //   blocks B+1 .. B+pages   page i at B+1+i, valid only when its bit is set
-// A page is written before its bit is set; the bit blocks are written by sync(), after the pages were made durable, and the
-// medium is flushed again afterwards, so a bit never promises a page that did not reach the medium before it.
+// Ops write through: write() returns only when the blocks are on the medium (the UFS store uses WRITE(10) with FUA). A run of pages
+// is written first and the bitmap blocks that gained a bit after it, both before the caller's write completes, so a bit never
+// promises a page that did not reach the medium, and a page the system was told is written is never lost to a crash. An
+// overwrite of a page whose bit is set changes only that page.
 // A header whose page count or seed digest differs from the current seed is stale and is replaced (the overlay starts empty): an
 // overlay is only ever applied on top of the exact seed it was made against.
 //
 // Ops: bool read(uint64_t block, uint32_t count, void *dst); bool write(uint64_t block, uint32_t count, const void *src);
-//      bool sync();   (blocks are relative to the window)
+//      bool sync();   (blocks are relative to the window; sync is only used while the header is made)
 #include <stdint.h>
 #include <string.h>
 
@@ -66,24 +68,23 @@ enum class Open { Resumed, Fresh, Blank, Failed };
 struct Overlay {
   uint64_t pages = 0, generation = 0, present = 0;
   uint8_t *bitmap = nullptr;       // bitmapBlocks(pages) * kBlock bytes, owned by the caller
-  uint8_t *dirty = nullptr;        // bitmapBlocks(pages) bytes, owned by the caller
-  bool readOnly = true, anyDirty = false, active = false;
+  bool readOnly = true, active = false;
   int header = -1;                 // checkHeader result at open
 
   bool has (uint64_t i) const { return bitmap[i >> 3] >> (i & 7) & 1; }
 
   // `readOnly`: never write; a stale or blank window is reported (Blank) and left alone. Otherwise it is initialised: bitmap
   // first, header last, so a tear leaves no valid header.
-  template <class Ops> Open open (Ops &ops, uint64_t pageCount, const uint8_t seed[32], bool ro, uint8_t *bits, uint8_t *dirtyFlags)
+  template <class Ops> Open open (Ops &ops, uint64_t pageCount, const uint8_t seed[32], bool ro, uint8_t *bits, bool discard = false)
   {
-    pages = pageCount; bitmap = bits; dirty = dirtyFlags; readOnly = ro; anyDirty = false; present = 0; active = false;
+    pages = pageCount; bitmap = bits; readOnly = ro; present = 0; active = false;
     uint64_t bb = bitmapBlocks (pages);
     uint8_t block[kBlock];
     if (!pages || !ops.read (0, 1, block)) return Open::Failed;
     header = checkHeader (block, pages, seed, &generation);
+    if (header == 0 && discard && !ro) header = 3;   // the caller asked to start over: handled like a stale overlay
     if (header == 0) {
       for (uint64_t b = 0; b < bb; ++b) if (!ops.read (1 + b, 1, bitmap + b * kBlock)) return Open::Failed;
-      memset (dirty, 0, bb);
       // Bits past the last page must be clear, or the loader would read blocks outside the window.
       for (uint64_t i = pages; i < bb * 8ULL * kBlock; ++i) if (has (i)) return Open::Failed;
       for (uint64_t i = 0; i < pages; ++i) present += has (i);
@@ -91,7 +92,6 @@ struct Overlay {
       return Open::Resumed;
     }
     memset (bitmap, 0, bb * kBlock);
-    memset (dirty, 0, bb);
     if (ro) return Open::Blank;
     uint8_t zero[kBlock] = {};
     for (uint64_t b = 0; b < bb; ++b) if (!ops.write (1 + b, 1, zero)) return Open::Failed;
@@ -103,41 +103,42 @@ struct Overlay {
     return Open::Fresh;
   }
 
-  // Calls load(index, page) for every present page, in order. Stops at the first failure.
-  template <class Ops, class Load> bool forEachPresent (Ops &ops, Load &load)
+  // Calls load(index, page) for every present page, in order, reading runs of up to maxRun consecutive present pages with one
+  // read into scratch (maxRun * kBlock bytes). Stops at the first failure.
+  template <class Ops, class Load> bool forEachPresent (Ops &ops, Load &load, uint8_t *scratch, uint32_t maxRun)
   {
-    uint8_t block[kBlock];
-    for (uint64_t i = 0; i < pages; ++i) {
-      if (!has (i)) continue;
-      if (!ops.read (pageBlock (pages, i), 1, block) || !load (i, block)) return false;
+    if (!maxRun) return false;
+    for (uint64_t i = 0; i < pages;) {
+      if (!has (i)) { ++i; continue; }
+      uint32_t n = 1;
+      while (n < maxRun && i + n < pages && has (i + n)) ++n;
+      if (!ops.read (pageBlock (pages, i), n, scratch)) return false;
+      for (uint32_t k = 0; k < n; ++k) if (!load (i + k, scratch + (uint64_t) k * kBlock)) return false;
+      i += n;
     }
     return true;
   }
 
-  template <class Ops> bool writePage (Ops &ops, uint64_t index, const void *page)
+  // Writes `count` consecutive pages starting at `index` (count * kBlock bytes at data), then the bitmap blocks that gained a bit.
+  // On false the run may be partly on the medium but no bit names a page that is not; the caller must stop using the overlay.
+  template <class Ops> bool writeRun (Ops &ops, uint64_t index, uint32_t count, const void *data)
   {
-    if (readOnly || !active || index >= pages) return false;
-    if (!ops.write (pageBlock (pages, index), 1, page)) return false;
-    if (!has (index)) { bitmap[index >> 3] |= uint8_t (1 << (index & 7)); ++present; }
-    dirty[index / (8ULL * kBlock)] = 1;
-    anyDirty = true;
-    return true;
-  }
-
-  template <class Ops> bool sync (Ops &ops)
-  {
-    if (readOnly || !active) return false;
-    if (!anyDirty) return true;
-    if (!ops.sync ()) return false;                       // pages durable before any bit that names them
-    uint64_t bb = bitmapBlocks (pages);
-    for (uint64_t b = 0; b < bb; ++b) {
-      if (!dirty[b]) continue;
-      if (!ops.write (1 + b, 1, bitmap + b * kBlock)) return false;
+    if (readOnly || !active || !count || index >= pages || count > pages - index) return false;
+    if (!ops.write (pageBlock (pages, index), count, data)) return false;
+    uint64_t firstBlock = ~0ULL, lastBlock = 0;
+    for (uint64_t i = index; i < index + count; ++i) {
+      if (has (i)) continue;
+      uint64_t b = i / (8ULL * kBlock);
+      if (firstBlock == ~0ULL) firstBlock = b;
+      lastBlock = b;
     }
-    if (!ops.sync ()) return false;
-    memset (dirty, 0, bb);
-    anyDirty = false;
+    // Set the bits only after the pages are durable; the bitmap blocks follow before this call returns.
+    for (uint64_t i = index; i < index + count; ++i)
+      if (!has (i)) { bitmap[i >> 3] |= uint8_t (1 << (i & 7)); ++present; }
+    if (firstBlock == ~0ULL) return true;
+    for (uint64_t b = firstBlock; b <= lastBlock; ++b) if (!ops.write (1 + b, 1, bitmap + b * kBlock)) return false;
     return true;
   }
+  template <class Ops> bool writePage (Ops &ops, uint64_t index, const void *page) { return writeRun (ops, index, 1, page); }
 };
 }  // namespace persist
