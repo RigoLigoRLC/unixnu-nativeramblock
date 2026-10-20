@@ -17,6 +17,7 @@
 #include <pexpert/pexpert.h>
 #include "SparseDisk.h"
 #include "PersistOverlay.h"
+#include "DirectDisk.h"
 
 extern "C" {
 extern unsigned long gPhysBase, gPhysSize;
@@ -57,8 +58,11 @@ class NativeRamBlock : public IOBlockStorageDevice {
   uint8_t *overlayBits = nullptr, *stage = nullptr;   // stage: kStagePages pages, one write or read run
   static constexpr uint32_t kStagePages = 32;
   bool storeAttached = false;
+  // Direct mode (the store is open read-write): changed pages live in the store window only, never in RAM; reads of them go to the
+  // window. A failed store write stops all further writes (a page the system was told is written must be on the medium).
+  bool direct = false, directFailed = false;
   struct StoreOps {
-    bool read(uint64_t b, uint32_t n, void *d) { return native_ufs_store_read(b, n, d); }
+    bool read(uint64_t b, uint32_t n, void *d) { __atomic_fetch_add(&native_data_persist_loaded, n, __ATOMIC_RELAXED); return native_ufs_store_read(b, n, d); }
     bool write(uint64_t b, uint32_t n, const void *s) { return native_ufs_store_write(b, n, s); }
     bool sync() { return native_ufs_store_sync(); }
   };
@@ -100,6 +104,11 @@ public:
           native_data_persist_state = 1;
         } else if (result == persist::Open::Fresh) {
           native_data_persist_state = 3;
+          direct = mode == 2;
+        } else if (mode == 2) {
+          // Resumed read-write: nothing is copied into RAM. The window answers for every page whose bit is set.
+          direct = true;
+          native_data_persist_state = 2;
         } else {
           struct Loader {
             NativeRamBlock *self;
@@ -237,8 +246,24 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
       uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
     } ops={buffer};
     bool write=buffer->getDirection()==kIODirectionOut;
+    if(direct){
+      struct BufferOps {
+        IOMemoryDescriptor *buffer;
+        uint64_t read(uint64_t at,void *p,uint64_t n){return buffer->readBytes(at,p,n);}
+        uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
+      } bops={buffer};
+      StoreOps store;bool storeError=false;
+      if(write && directFailed)actual=0;
+      else actual=directDiskIO(sparse,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError);
+      if(storeError){
+        if(write)directFailed=true;
+        native_data_persist_state=5;__atomic_fetch_add(&native_data_persist_errors,1,__ATOMIC_RELAXED);
+      }
+      if(write && actual){__atomic_fetch_add(&native_data_persist_writes,(actual+4095)/4096,__ATOMIC_RELAXED);__atomic_fetch_add(&native_data_persist_syncs,1,__ATOMIC_RELAXED);native_data_persist_present=overlay.present;}
+    } else {
     actual=ramSparseIO(sparse,write,block*512,bytes,ops,noMemory);
-    if(write && actual==bytes && overlay.active && !overlay.readOnly){
+    }
+    if(!direct && write && actual==bytes && overlay.active && !overlay.readOnly){
       StoreOps store;
       uint64_t firstPage=block*512/4096,lastPage=(block*512+bytes-1)/4096;
       for(uint64_t i=firstPage;i<=lastPage && overlay.active;){
