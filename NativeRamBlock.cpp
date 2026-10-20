@@ -53,6 +53,10 @@ class NativeRamBlock : public IOBlockStorageDevice {
   uint64_t capacity = 0;
   bool online = false;
   RamSparseDisk sparse = {};
+  // A disk above 2 GiB keeps only the nonzero pages of its seed (SeedDisk.h), in memory proportional to the content, and is served by the
+  // direct (store-backed) path alone: it needs the persistent store open read-write, or its requests fail.
+  SeedDisk big = {};
+  bool isBig = false;
   uint8_t seedHash[32] = {};
   persist::Overlay overlay;
   uint8_t *overlayBits = nullptr, *stage = nullptr;   // stage: kStagePages pages, one write or read run
@@ -79,9 +83,9 @@ public:
     if (storeAttached) { IOLockUnlock(gate); return; }
     storeAttached = true;
     unsigned mode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
-    if (mode && sparse.pages && &native_ufs_store_open && &native_ufs_store_read && &native_ufs_store_write &&
+    if (mode && (sparse.pages || isBig) && &native_ufs_store_open && &native_ufs_store_read && &native_ufs_store_write &&
         &native_ufs_store_sync && &native_ufs_store_gpt_check) {
-      uint64_t pages = sparse.bytes / 4096, first = 0;
+      uint64_t pages = (isBig ? big.bytes : sparse.bytes) / 4096, first = 0;
       const char *why = "";
       native_data_persist_pages = pages;
       native_data_persist_gpt = native_ufs_store_gpt_check();
@@ -142,11 +146,11 @@ public:
     IOLockUnlock(gate);
   }
 
-  bool available() const { return online && (memory || sparse.pages) && capacity; }
+  bool available() const { return online && (memory || sparse.pages || isBig) && capacity; }
   bool seedInfo(uint64_t *base,uint64_t *bytes,uint8_t hash[32]) {
     if(!gate || !base || !bytes || !hash)return false;
     IOLockLock(gate);bool ready=available();
-    if(ready){*base=sparse.pages?0:reinterpret_cast<uint64_t>(memory);*bytes=capacity*512;memcpy(hash,seedHash,32);}
+    if(ready){*base=(sparse.pages||isBig)?0:reinterpret_cast<uint64_t>(memory);*bytes=capacity*512;memcpy(hash,seedHash,32);}
     IOLockUnlock(gate);return ready;
   }
   bool start(IOService *) override;
@@ -203,24 +207,40 @@ bool NativeRamBlock::start(IOService *provider)
   uint64_t logical=bytes;
   if(packedInput){
     if(!ramPackedLayout(memory,bytes,&logical))return false;
-    sparse.bytes=logical;
-    sparse.pages=static_cast<uint8_t **>(IOMallocZero((logical/4096)*sizeof(uint8_t *)));
     struct ImportOps {uint8_t *allocate(){return static_cast<uint8_t *>(IOMallocZero(4096));}} ops;
-    if(!ramSparseImport(sparse,memory,bytes,ops))return false;
+    if(logical>0x80000000ULL){
+      uint64_t nonzero=0;
+      if(!seedCountNonzero(memory,bytes,&nonzero))return false;
+      big.bytes=logical;big.capacity=nonzero;
+      big.index=static_cast<uint64_t *>(IOMallocZero((nonzero?nonzero:1)*sizeof(uint64_t)));
+      big.page=static_cast<uint8_t **>(IOMallocZero((nonzero?nonzero:1)*sizeof(uint8_t *)));
+      if(!big.index||!big.page||!seedImportSparse(big,memory,bytes,ops))return false;
+      isBig=true;sparse.bytes=logical;
+    }else{
+      sparse.bytes=logical;
+      sparse.pages=static_cast<uint8_t **>(IOMallocZero((logical/4096)*sizeof(uint8_t *)));
+      if(!ramSparseImport(sparse,memory,bytes,ops))return false;
+    }
   }
   capacity = logical / 512;
   SHA256_CTX context;
   SHA256_Init(&context);
+  if(isBig){
+    seedIdentity(big,context,[](SHA256_CTX &c){SHA256_Init(&c);},[](SHA256_CTX &c,const void *p,size_t n){SHA256_Update(&c,p,n);},
+                 [](SHA256_CTX &c,uint8_t *out){SHA256_Final(out,&c);},seedHash);
+    memory=nullptr;
+  }else{
   if(sparse.pages){
     static const uint8_t zero[4096]={};
     for(uint64_t i=0;i<logical/4096;++i)SHA256_Update(&context,sparse.pages[i]?sparse.pages[i]:zero,4096);
     memory=nullptr;
   }else SHA256_Update(&context, memory, bytes);
   SHA256_Final(seedHash, &context);
+  }
   memcpy(native_ram_block_seed_sha256,seedHash,32);
   native_ram_block_bytes = logical;
-  native_ram_block_sparse=sparse.pages?1:0;
-  native_ram_block_resident_bytes=sparse.pages?sparse.resident:logical;
+  native_ram_block_sparse=(sparse.pages||isBig)?1:0;
+  native_ram_block_resident_bytes=isBig?big.resident:sparse.pages?sparse.resident:logical;
   online = true;
   native_ram_block_ready = 1;
   registerService();
@@ -238,7 +258,8 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   IOLockLock(gate);
   if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
   uint64_t actual;bool noMemory=false;
-  if(sparse.pages){
+  if(isBig && !direct){IOLockUnlock(gate);return kIOReturnNotReady;}   // a disk this size has no volatile mode
+  if(sparse.pages||isBig){
     struct Operations {
       IOMemoryDescriptor *buffer;
       uint8_t *allocate(){return static_cast<uint8_t *>(IOMallocZero(4096));}
@@ -254,7 +275,8 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
       } bops={buffer};
       StoreOps store;bool storeError=false;
       if(write && directFailed)actual=0;
-      else actual=directDiskIO(sparse,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError);
+      else actual=isBig?directDiskIO(big,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError)
+                       :directDiskIO(sparse,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError);
       if(storeError){
         if(write)directFailed=true;
         native_data_persist_state=5;__atomic_fetch_add(&native_data_persist_errors,1,__ATOMIC_RELAXED);
@@ -278,7 +300,7 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     }
     if(write)__atomic_fetch_add(&native_ram_block_writes,1,__ATOMIC_RELAXED);
     else __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
-    native_ram_block_resident_bytes=sparse.resident;
+    native_ram_block_resident_bytes=isBig?big.resident:sparse.resident;
   }else if (buffer->getDirection() == kIODirectionIn) {
     actual = buffer->writeBytes(0, memory + block * 512, bytes);
     __atomic_fetch_add(&native_ram_block_reads, 1, __ATOMIC_RELAXED);
@@ -303,6 +325,12 @@ void NativeRamBlock::free()
 {
   if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks(sparse.bytes / 4096) * persist::kBlock); overlayBits = nullptr; }
   if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
+  if (isBig) {
+    for (uint64_t k = 0; k < big.count; ++k) IOFree(big.page[k], 4096);
+    if (big.index) IOFree(big.index, (big.capacity ? big.capacity : 1) * sizeof(uint64_t));
+    if (big.page) IOFree(big.page, (big.capacity ? big.capacity : 1) * sizeof(uint8_t *));
+    big = {}; isBig = false;
+  }
   if (gate) { IOLockFree(gate); gate = nullptr; }
   if(sparse.pages){
     for(uint64_t i=0;i<sparse.bytes/4096;++i)if(sparse.pages[i])IOFree(sparse.pages[i],4096);

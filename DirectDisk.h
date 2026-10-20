@@ -9,15 +9,16 @@
 // `stage` is stagePages * 4096 bytes. Returns the bytes completed; *storeError is set when the store refused or failed (a short
 // copy by the buffer is not a store error). Caller serializes I/O.
 #include "SparseDisk.h"
+#include "SeedDisk.h"
 #include "PersistOverlay.h"
 
-template<class Store, class Buf>
-static uint64_t directDiskIO(RamSparseDisk &seed, persist::Overlay &ov, Store &store, uint8_t *stage, uint32_t stagePages, bool write,
+template<class Seed, class Store, class Buf>
+static uint64_t directDiskIO(const Seed &seed, persist::Overlay &ov, Store &store, uint8_t *stage, uint32_t stagePages, bool write,
                              uint64_t offset, uint64_t length, Buf &buf, bool *storeError)
 {
   static const uint8_t zero[4096] = {};
   *storeError = false;
-  if (!seed.pages || !stagePages || !length || offset > seed.bytes || length > seed.bytes - offset) return 0;
+  if (!stagePages || !length || offset > seed.bytes || length > seed.bytes - offset) return 0;
   if (!ov.active || (write && ov.readOnly)) return 0;
   const uint64_t lastIndex = (offset + length - 1) / 4096;
   uint64_t done = 0;
@@ -37,7 +38,7 @@ static uint64_t directDiskIO(RamSparseDisk &seed, persist::Overlay &ov, Store &s
       }
       uint64_t n = 4096 - skip;
       if (n > length - done) n = length - done;
-      const uint8_t *page = seed.pages[index];
+      const uint8_t *page = seed.find(index);
       uint64_t got = buf.copy(done, (page ? page : zero) + skip, n);
       done += got;
       if (got != n) break;
@@ -56,7 +57,7 @@ static uint64_t directDiskIO(RamSparseDisk &seed, persist::Overlay &ov, Store &s
     if (ov.has(index)) {
       if (!store.read(persist::pageBlock(ov.pages, index), 1, stage)) { *storeError = true; break; }
     } else {
-      const uint8_t *page = seed.pages[index];
+      const uint8_t *page = seed.find(index);
       memcpy(stage, page ? page : zero, 4096);
     }
     if (buf.read(done, stage + skip, n) != n) break;
