@@ -71,8 +71,8 @@ public:
   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
   // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
   // (seedHash) is not affected. Any refusal or error leaves the disk volatile, exactly as without persistence.
-  // sheng-data-reset=1 starts the overlay over (the old pages are dropped, not applied).
-  static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-reset", &v, sizeof v) && v == 1; }
+  // sheng-data-reset=1 or 2 starts the overlay over (the old pages are dropped, not applied); 2 also asks for Setup (BootWatchdogPolicy.c).
+  static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-reset", &v, sizeof v) && (v == 1 || v == 2); }
   void attachStore() {
     if (!gate) return;
     IOLockLock(gate);
