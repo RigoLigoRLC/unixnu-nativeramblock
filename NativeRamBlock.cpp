@@ -258,7 +258,32 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   IOLockLock(gate);
   if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
   uint64_t actual;bool noMemory=false;
-  if(isBig && !direct){IOLockUnlock(gate);return kIOReturnNotReady;}   // a disk this size has no volatile mode
+  if(isBig && !direct) {
+    // Before the store is attached (APFS probes the disk for its volume UUID long before the kernel asks for the Data volume, which is what
+    // attaches the store) a disk this size is read from its seed alone; it has no volatile mode, so writes wait.
+    if(buffer->getDirection()==kIODirectionIn) {
+      struct SeedReadOps {
+        IOMemoryDescriptor *buffer;
+        uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
+      } rops={buffer};
+      static const uint8_t zero[4096]={};
+      uint64_t done=0,offset=block*512;
+      while(done<bytes) {
+        uint64_t at=offset+done,index=at/4096,skip=at&4095,n=4096-skip;
+        if(n>bytes-done)n=bytes-done;
+        const uint8_t *page=big.find(index);
+        uint64_t got=rops.copy(done,(page?page:zero)+skip,n);
+        done+=got;if(got!=n)break;
+      }
+      __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
+      IOReturn early=done==bytes?kIOReturnSuccess:kIOReturnIOError;
+      if(early)__atomic_fetch_add(&native_ram_block_failures,1,__ATOMIC_RELAXED);
+      IOLockUnlock(gate);
+      completion->action(completion->target,completion->parameter,early,done);
+      return kIOReturnSuccess;
+    }
+    IOLockUnlock(gate);return kIOReturnNotReady;
+  }
   if(sparse.pages||isBig){
     struct Operations {
       IOMemoryDescriptor *buffer;
