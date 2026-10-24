@@ -74,8 +74,8 @@ class NativeRamBlock : public IOBlockStorageDevice {
 public:
   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
   // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
-  // (seedHash) is not affected. Any refusal or error leaves the disk volatile, exactly as without persistence.
-  // sheng-data-reset=1 or 2 starts the overlay over (the old pages are dropped, not applied); 2 also asks for Setup (BootWatchdogPolicy.c).
+  // (seedHash) is not affected. Read-write persistence refuses startup if the store
+  // cannot open. sheng-data-reset=1 or 2 explicitly initializes or replaces Data.
   static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-reset", &v, sizeof v) && (v == 1 || v == 2); }
   void attachStore() {
     if (!gate) return;
@@ -142,6 +142,10 @@ public:
         native_data_persist_present = overlay.present;
         native_data_persist_gpt_after = native_ufs_store_gpt_check();
       }
+    }
+    if (mode == 2 && !direct) {
+      panic("NativeRamBlock: persistent Data refused (state %u header %u); use Install and boot to initialize or reset Data",
+            native_data_persist_state, native_data_persist_header);
     }
     IOLockUnlock(gate);
   }

@@ -11,8 +11,8 @@
 // is written first and the bitmap blocks that gained a bit after it, both before the caller's write completes, so a bit never
 // promises a page that did not reach the medium, and a page the system was told is written is never lost to a crash. An
 // overwrite of a page whose bit is set changes only that page.
-// A header whose page count or seed digest differs from the current seed is stale and is replaced (the overlay starts empty): an
-// overlay is only ever applied on top of the exact seed it was made against.
+// An overlay is applied only to its exact seed and page count. Creating or replacing
+// its header requires an explicit discard request from the installation entry.
 //
 // Ops: bool read(uint64_t block, uint32_t count, void *dst); bool write(uint64_t block, uint32_t count, const void *src);
 //      bool sync();   (blocks are relative to the window; sync is only used while the header is made)
@@ -73,8 +73,8 @@ struct Overlay {
 
   bool has (uint64_t i) const { return bitmap[i >> 3] >> (i & 7) & 1; }
 
-  // `readOnly`: never write; a stale or blank window is reported (Blank) and left alone. Otherwise it is initialised: bitmap
-  // first, header last, so a tear leaves no valid header.
+  // A read-only open reports an unusable header without writing. A writable open
+  // initializes the bitmap and header only when the caller explicitly discards Data.
   template <class Ops> Open open (Ops &ops, uint64_t pageCount, const uint8_t seed[32], bool ro, uint8_t *bits, bool discard = false)
   {
     pages = pageCount; bitmap = bits; readOnly = ro; present = 0; active = false;
@@ -93,7 +93,14 @@ struct Overlay {
     }
     memset (bitmap, 0, bb * kBlock);
     if (ro) return Open::Blank;
+    if (!discard) {
+      return Open::Failed;
+    }
     uint8_t zero[kBlock] = {};
+    // An interrupted explicit reset must not resume the previous header with a partial bitmap.
+    if (!ops.write (0, 1, zero) || !ops.sync ()) {
+      return Open::Failed;
+    }
     for (uint64_t b = 0; b < bb; ++b) if (!ops.write (1 + b, 1, zero)) return Open::Failed;
     if (!ops.sync ()) return Open::Failed;
     generation = (header == 3 || header == 2) ? generation + 1 : 1;
