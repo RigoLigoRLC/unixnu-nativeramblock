@@ -7,13 +7,14 @@
 //        uint64_t copy(uint64_t at, const void *p, uint64_t n)  bytes into the request buffer (the data of a read)
 //   Store: bool read(block, count, dst); bool write(block, count, src)   (PersistOverlay.h's Ops)
 // `stage` is stagePages * 4096 bytes. Returns the bytes completed; *storeError is set when the store refused or failed (a short
-// copy by the buffer is not a store error). Caller serializes I/O.
+// copy by the buffer is not a store error). The caller excludes overlapping page ranges and provides request-owned staging.
+// The overlay owns serialization of presence bitmap updates after durable data writes.
 #include "SparseDisk.h"
 #include "SeedDisk.h"
 #include "PersistOverlay.h"
 
-template<class Seed, class Store, class Buf>
-static uint64_t directDiskIO(const Seed &seed, persist::Overlay &ov, Store &store, uint8_t *stage, uint32_t stagePages, bool write,
+template<class Seed, class Overlay, class Store, class Buf>
+static uint64_t directDiskIO(const Seed &seed, Overlay &ov, Store &store, uint8_t *stage, uint32_t stagePages, bool write,
                              uint64_t offset, uint64_t length, Buf &buf, bool *storeError)
 {
   static const uint8_t zero[4096] = {};

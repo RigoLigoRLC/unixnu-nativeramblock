@@ -14,6 +14,7 @@
 #include <machine/machine_routines.h>
 #include <vm/vm_kern.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include "SparseDisk.h"
 #include "PersistOverlay.h"
@@ -46,12 +47,85 @@ volatile uint64_t native_data_persist_pages = 0, native_data_persist_loaded = 0,
                   native_data_persist_present = 0;
 }
 
+// DataStats accumulates request admission, descriptor bytes and metadata costs.
+// Durations use the kernel absolute clock; the dump function reports microseconds.
+struct DataStats {
+  uint64_t active = 0, queued = 0, peakActive = 0, peakQueued = 0;
+  uint64_t readBytes = 0, writeBytes = 0;
+  uint64_t rangeWait = 0, rangeWaitMax = 0;
+  uint64_t bitmapWait = 0, bitmapWaitMax = 0;
+  uint64_t bitmapCommits = 0, bitmapTime = 0;
+  uint64_t flushes = 0, flushTime = 0;
+};
+static DataStats dataStats;
+
+static uint64_t dataNow()
+{
+  uint64_t now;
+  clock_get_uptime(&now);
+  return now;
+}
+
+static void dataMaximum(uint64_t *counter, uint64_t value)
+{
+  uint64_t previous = __atomic_load_n(counter, __ATOMIC_RELAXED);
+  while (previous < value && !__atomic_compare_exchange_n(counter, &previous, value, false,
+                                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+  }
+}
+
+static uint64_t dataMicroseconds(uint64_t *counter)
+{
+  uint64_t nanoseconds;
+  absolutetime_to_nanoseconds(__atomic_load_n(counter, __ATOMIC_RELAXED), &nanoseconds);
+  return nanoseconds / 1000;
+}
+
+extern "C" void native_ram_block_dump_stats(void)
+{
+  IOLog("NativeRamBlock stats: active=%llu queued=%llu peak_active=%llu peak_queued=%llu read_bytes=%llu write_bytes=%llu\n",
+        __atomic_load_n(&dataStats.active, __ATOMIC_RELAXED),
+        __atomic_load_n(&dataStats.queued, __ATOMIC_RELAXED),
+        __atomic_load_n(&dataStats.peakActive, __ATOMIC_RELAXED),
+        __atomic_load_n(&dataStats.peakQueued, __ATOMIC_RELAXED),
+        __atomic_load_n(&dataStats.readBytes, __ATOMIC_RELAXED),
+        __atomic_load_n(&dataStats.writeBytes, __ATOMIC_RELAXED));
+  IOLog("NativeRamBlock stats: range_wait_us=%llu range_wait_max_us=%llu bitmap_wait_us=%llu bitmap_wait_max_us=%llu bitmap_commits=%llu bitmap_commit_us=%llu flushes=%llu flush_us=%llu\n",
+        dataMicroseconds(&dataStats.rangeWait), dataMicroseconds(&dataStats.rangeWaitMax),
+        dataMicroseconds(&dataStats.bitmapWait), dataMicroseconds(&dataStats.bitmapWaitMax),
+        __atomic_load_n(&dataStats.bitmapCommits, __ATOMIC_RELAXED), dataMicroseconds(&dataStats.bitmapTime),
+        __atomic_load_n(&dataStats.flushes, __ATOMIC_RELAXED), dataMicroseconds(&dataStats.flushTime));
+}
+
+// NativeRamBlock exposes the seeded Data disk as 512-byte sectors. Persistent I/O
+// reserves complete 4096-byte pages in arrival order, then transfers unrelated
+// ranges concurrently through NativeUfs. Each request owns its data and bitmap
+// scratch space. New presence bits become visible after their bitmap block is
+// durably written; NativeUfs owns command completion and FUA handling.
+//
+// The gate protects request admission and storage-mode changes. Bitmap commits
+// have a separate mutex. A whole-disk range orders cache synchronization against
+// earlier and later requests. stop closes admission and drains all ranges;
+// requests retain the service until their unlocked completion callback returns.
 class NativeRamBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeRamBlock)
   IOLock *gate = nullptr;
+  IOLock *bitmapGate = nullptr;
+  // Requests remain in arrival order until their I/O ends. A request waits for every
+  // earlier overlapping page range, including earlier requests still waiting.
+  struct Range {
+    uint64_t first = 0, last = 0;
+    Range *next = nullptr;
+    bool active = false;
+  };
+  Range *ranges = nullptr;
+  bool acquireRange(Range &, uint64_t, uint64_t, bool);
+  void releaseRange(Range &);
   uint8_t *memory = nullptr;
   uint64_t capacity = 0;
   bool online = false;
+  bool shuttingDown = false, shutdownRunning = false, shutdownComplete = false;
+  int shutdownResult = 0;
   RamSparseDisk sparse = {};
   // A disk above 2 GiB keeps only the nonzero pages of its seed (SeedDisk.h), in memory proportional to the content, and is served by the
   // direct (store-backed) path alone: it needs the persistent store open read-write, or its requests fail.
@@ -59,7 +133,8 @@ class NativeRamBlock : public IOBlockStorageDevice {
   bool isBig = false;
   uint8_t seedHash[32] = {};
   persist::Overlay overlay;
-  uint8_t *overlayBits = nullptr, *stage = nullptr;   // stage: kStagePages pages, one write or read run
+  uint8_t *overlayBits = nullptr;
+  uint8_t *stage = nullptr;   // Startup restoration and serialized small-disk persistence use this buffer.
   static constexpr uint32_t kStagePages = 32;
   bool storeAttached = false;
   // Direct mode (the store is open read-write): changed pages live in the store window only, never in RAM; reads of them go to the
@@ -70,6 +145,23 @@ class NativeRamBlock : public IOBlockStorageDevice {
     bool write(uint64_t b, uint32_t n, const void *s) { return native_ufs_store_write(b, n, s); }
     bool sync() { return native_ufs_store_sync(); }
   };
+  // DirectOverlay presents immutable seed geometry and concurrent presence reads to
+  // directDiskIO. NativeRamBlock commits changed bitmap blocks after data reaches UFS.
+  struct DirectOverlay {
+    NativeRamBlock *owner;
+    uint8_t *bitmapStage;
+    uint64_t pages;
+    bool active, readOnly;
+
+    bool has(uint64_t index) const {
+      return (__atomic_load_n(owner->overlay.bitmap + (index >> 3), __ATOMIC_ACQUIRE) >> (index & 7)) & 1;
+    }
+
+    bool writeRun(StoreOps &store, uint64_t index, uint32_t count, const void *data) {
+      return owner->writeDirectRun(store, index, count, data, bitmapStage);
+    }
+  };
+  bool writeDirectRun(StoreOps &, uint64_t, uint32_t, const void *, uint8_t *);
   void persistFailed() { overlay.active = false; native_data_persist_state = 5; __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED); }
 public:
   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
@@ -158,6 +250,7 @@ public:
     IOLockUnlock(gate);return ready;
   }
   bool start(IOService *) override;
+  int shutdownData();
   void stop(IOService *) override;
   void free() override;
   IOReturn doEjectMedia() override { return kIOReturnUnsupported; }
@@ -175,11 +268,7 @@ public:
   }
   IOReturn reportRemovability(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn reportWriteProtection(bool *value) override { *value = false; return kIOReturnSuccess; }
-  IOReturn doSynchronizeCache() override {
-    if (!online) return kIOReturnNotReady;
-    // Every changed page is on the medium, with its bitmap bit, before its write completed (PersistOverlay.h): nothing to flush.
-    return kIOReturnSuccess;
-  }
+  IOReturn doSynchronizeCache() override;
   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
   IOReturn getWriteCacheState(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
@@ -207,7 +296,7 @@ bool NativeRamBlock::start(IOService *provider)
   if (!bytes || bytes > 0x80000000 || (physical & 4095) || (!packedInput && (bytes & 4095)) ||
       physical < gPhysBase || bytes > gPhysSize || physical - gPhysBase > gPhysSize - bytes) return false;
   memory = reinterpret_cast<uint8_t *>(ml_static_ptovirt(physical));
-  if (!memory || !(gate = IOLockAlloc())) return false;
+  if (!memory || !(gate = IOLockAlloc()) || !(bitmapGate = IOLockAlloc())) return false;
   uint64_t logical=bytes;
   if(packedInput){
     if(!ramPackedLayout(memory,bytes,&logical))return false;
@@ -251,6 +340,244 @@ bool NativeRamBlock::start(IOService *provider)
   return true;
 }
 
+// Success returns with gate held so the caller can select the stable storage mode.
+// Sleep releases gate; storage completion never runs while this mutex is held.
+bool NativeRamBlock::acquireRange(Range &range, uint64_t first, uint64_t last, bool barrier)
+{
+  uint64_t started = dataNow();
+  IOLockLock(gate);
+  if (!online || shuttingDown) {
+    IOLockUnlock(gate);
+    return false;
+  }
+
+  range.first = barrier || !direct ? 0 : first;
+  range.last = barrier || !direct ? (capacity * 512 - 1) / 4096 : last;
+  Range **tail = &ranges;
+  while (*tail) {
+    tail = &(*tail)->next;
+  }
+  *tail = &range;
+  uint64_t queued = __atomic_add_fetch(&dataStats.queued, 1, __ATOMIC_RELAXED);
+  dataMaximum(&dataStats.peakQueued, queued);
+
+  while (online) {
+    bool blocked = false;
+    for (Range *prior = ranges; prior != &range; prior = prior->next) {
+      if (range.first <= prior->last && prior->first <= range.last) {
+        blocked = true;
+        break;
+      }
+    }
+    if (!blocked) {
+      range.active = true;
+      __atomic_fetch_sub(&dataStats.queued, 1, __ATOMIC_RELAXED);
+      uint64_t active = __atomic_add_fetch(&dataStats.active, 1, __ATOMIC_RELAXED);
+      dataMaximum(&dataStats.peakActive, active);
+      uint64_t elapsed = dataNow() - started;
+      __atomic_fetch_add(&dataStats.rangeWait, elapsed, __ATOMIC_RELAXED);
+      dataMaximum(&dataStats.rangeWaitMax, elapsed);
+      return true;
+    }
+    IOLockSleep(gate, &ranges, THREAD_UNINT);
+  }
+
+  uint64_t elapsed = dataNow() - started;
+  __atomic_fetch_add(&dataStats.rangeWait, elapsed, __ATOMIC_RELAXED);
+  dataMaximum(&dataStats.rangeWaitMax, elapsed);
+  IOLockUnlock(gate);
+  releaseRange(range);
+  return false;
+}
+
+void NativeRamBlock::releaseRange(Range &range)
+{
+  IOLockLock(gate);
+  Range **link = &ranges;
+  while (*link != &range) {
+    link = &(*link)->next;
+  }
+  *link = range.next;
+  __atomic_fetch_sub(range.active ? &dataStats.active : &dataStats.queued, 1, __ATOMIC_RELAXED);
+  IOLockWakeup(gate, &ranges, false);
+  IOLockUnlock(gate);
+}
+
+bool NativeRamBlock::writeDirectRun(StoreOps &store, uint64_t index, uint32_t count,
+    const void *data, uint8_t *bitmapStage)
+{
+  if (__atomic_load_n(&directFailed, __ATOMIC_ACQUIRE) || !overlay.active || overlay.readOnly ||
+      !count || index >= overlay.pages || count > overlay.pages - index) {
+    return false;
+  }
+
+  if (!store.write(persist::pageBlock(overlay.pages, index), count, data)) {
+    __atomic_store_n(&directFailed, true, __ATOMIC_RELEASE);
+    return false;
+  }
+
+  bool missing = false;
+  for (uint64_t page = index; page < index + count; ++page) {
+    if (!(__atomic_load_n(overlay.bitmap + (page >> 3), __ATOMIC_ACQUIRE) & (1U << (page & 7)))) {
+      missing = true;
+      break;
+    }
+  }
+  if (!missing) {
+    return true;
+  }
+
+  // Data writes run concurrently. A new presence bit requires a serialized read,
+  // merge and durable write of its complete bitmap block, shared by 32768 pages.
+  uint64_t waitStarted = dataNow();
+  IOLockLock(bitmapGate);
+  uint64_t waited = dataNow() - waitStarted;
+  __atomic_fetch_add(&dataStats.bitmapWait, waited, __ATOMIC_RELAXED);
+  dataMaximum(&dataStats.bitmapWaitMax, waited);
+  bool success = !__atomic_load_n(&directFailed, __ATOMIC_ACQUIRE);
+  const uint64_t firstBlock = index / (8ULL * persist::kBlock);
+  const uint64_t lastBlock = (index + count - 1) / (8ULL * persist::kBlock);
+  for (uint64_t block = firstBlock; success && block <= lastBlock; ++block) {
+    uint8_t *bits = overlay.bitmap + block * persist::kBlock;
+    memcpy(bitmapStage, bits, persist::kBlock);
+    uint64_t firstPage = block * 8ULL * persist::kBlock;
+    uint64_t endPage = firstPage + 8ULL * persist::kBlock;
+    uint64_t begin = index > firstPage ? index : firstPage;
+    uint64_t end = index + count < endPage ? index + count : endPage;
+    uint64_t added = 0;
+    for (uint64_t page = begin; page < end; ++page) {
+      uint64_t offset = (page - firstPage) >> 3;
+      uint8_t mask = static_cast<uint8_t>(1U << (page & 7));
+      if (!(bitmapStage[offset] & mask)) {
+        bitmapStage[offset] |= mask;
+        ++added;
+      }
+    }
+    if (!added) {
+      continue;
+    }
+    uint64_t commitStarted = dataNow();
+    bool committed = store.write(1 + block, 1, bitmapStage);
+    __atomic_fetch_add(&dataStats.bitmapCommits, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&dataStats.bitmapTime, dataNow() - commitStarted, __ATOMIC_RELAXED);
+    if (!committed) {
+      __atomic_store_n(&directFailed, true, __ATOMIC_RELEASE);
+      success = false;
+      break;
+    }
+    for (uint64_t byte = (begin - firstPage) >> 3; byte <= (end - firstPage - 1) >> 3; ++byte) {
+      __atomic_store_n(bits + byte, bitmapStage[byte], __ATOMIC_RELEASE);
+    }
+    __atomic_fetch_add(&overlay.present, added, __ATOMIC_RELAXED);
+  }
+  IOLockUnlock(bitmapGate);
+  return success;
+}
+
+IOReturn NativeRamBlock::doSynchronizeCache()
+{
+  if (!gate) {
+    return kIOReturnNotReady;
+  }
+  retain();
+  Range range;
+  if (!acquireRange(range, 0, 0, true)) {
+    release();
+    return kIOReturnNotReady;
+  }
+  bool persistent = direct;
+  IOLockUnlock(gate);
+
+  IOReturn status = kIOReturnSuccess;
+  uint64_t flushStarted = dataNow();
+  if (persistent && (__atomic_load_n(&directFailed, __ATOMIC_ACQUIRE) || !native_ufs_store_sync())) {
+    __atomic_store_n(&directFailed, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&native_data_persist_state, 5U, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED);
+    status = kIOReturnIOError;
+  }
+  __atomic_fetch_add(&dataStats.flushes, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&dataStats.flushTime, dataNow() - flushStarted, __ATOMIC_RELAXED);
+  releaseRange(range);
+  release();
+  return status;
+}
+
+int NativeRamBlock::shutdownData()
+{
+  if (!gate) {
+    return 1;
+  }
+  uint64_t deadline;
+  clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
+  IOLockLock(gate);
+  while (shutdownRunning) {
+    if (IOLockSleepDeadline(gate, &shutdownRunning, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
+      IOLockUnlock(gate);
+      return 0;
+    }
+  }
+  if (shutdownComplete) {
+    int result = shutdownResult;
+    IOLockUnlock(gate);
+    return result;
+  }
+
+  // Existing queued ranges retain their ordering and finish their bitmap commits.
+  // Admission closes before draining, so no later read, write or flush can enter.
+  shuttingDown = true;
+  shutdownRunning = true;
+  while (ranges) {
+    if (IOLockSleepDeadline(gate, &ranges, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
+      shutdownRunning = false;
+      shutdownComplete = true;
+      shutdownResult = 0;
+      IOLockWakeup(gate, &shutdownRunning, false);
+      IOLockUnlock(gate);
+      return 0;
+    }
+  }
+  bool persistent = direct;
+  IOLockUnlock(gate);
+
+  int result = !persistent || (!__atomic_load_n(&directFailed, __ATOMIC_ACQUIRE) && native_ufs_store_sync());
+  IOLockLock(gate);
+  shutdownResult = result;
+  shutdownComplete = true;
+  shutdownRunning = false;
+  IOLockWakeup(gate, &shutdownRunning, false);
+  IOLockUnlock(gate);
+  return result;
+}
+
+// The shutdown caller invokes this before NativeUfs closes command admission.
+// Each matched Data service is retained while its ranges drain.
+extern "C" int native_ram_block_shutdown(void)
+{
+  OSDictionary *matching = IOService::serviceMatching("NativeRamBlock");
+  if (!matching) {
+    return 0;
+  }
+  OSIterator *iterator = IOService::getMatchingServices(matching);
+  matching->release();
+  if (!iterator) {
+    return 0;
+  }
+  int result = 1;
+  while (OSObject *object = iterator->getNextObject()) {
+    NativeRamBlock *ram = OSDynamicCast(NativeRamBlock, object);
+    if (ram) {
+      ram->retain();
+      if (!ram->shutdownData()) {
+        result = 0;
+      }
+      ram->release();
+    }
+  }
+  iterator->release();
+  return result;
+}
+
 IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
     IOStorageAttributes *, IOStorageCompletion *completion)
 {
@@ -259,8 +586,13 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
       (buffer->getDirection() != kIODirectionIn && buffer->getDirection() != kIODirectionOut)) return kIOReturnBadArgument;
   if (!gate) return kIOReturnNotReady;
   const uint64_t bytes = count * 512;
-  IOLockLock(gate);
-  if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
+  retain();
+  Range range;
+  if (!acquireRange(range, block * 512 / 4096, (block * 512 + bytes - 1) / 4096, false)) {
+    release();
+    return kIOReturnNotReady;
+  }
+  bool gateHeld = true;
   uint64_t actual;bool noMemory=false;
   if(isBig && !direct) {
     // Before the store is attached (APFS probes the disk for its volume UUID long before the kernel asks for the Data volume, which is what
@@ -280,13 +612,19 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
         done+=got;if(got!=n)break;
       }
       __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
+      __atomic_fetch_add(&dataStats.readBytes, done, __ATOMIC_RELAXED);
       IOReturn early=done==bytes?kIOReturnSuccess:kIOReturnIOError;
       if(early)__atomic_fetch_add(&native_ram_block_failures,1,__ATOMIC_RELAXED);
       IOLockUnlock(gate);
+      releaseRange(range);
       completion->action(completion->target,completion->parameter,early,done);
+      release();
       return kIOReturnSuccess;
     }
-    IOLockUnlock(gate);return kIOReturnNotReady;
+    IOLockUnlock(gate);
+    releaseRange(range);
+    release();
+    return kIOReturnNotReady;
   }
   if(sparse.pages||isBig){
     struct Operations {
@@ -297,20 +635,41 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     } ops={buffer};
     bool write=buffer->getDirection()==kIODirectionOut;
     if(direct){
+      IOLockUnlock(gate);
+      gateHeld = false;
+      uint8_t *requestStage = static_cast<uint8_t *>(IOMalloc((kStagePages + 1) * persist::kBlock));
       struct BufferOps {
         IOMemoryDescriptor *buffer;
         uint64_t read(uint64_t at,void *p,uint64_t n){return buffer->readBytes(at,p,n);}
         uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
       } bops={buffer};
       StoreOps store;bool storeError=false;
-      if(write && directFailed)actual=0;
-      else actual=isBig?directDiskIO(big,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError)
-                       :directDiskIO(sparse,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError);
-      if(storeError){
-        if(write)directFailed=true;
-        native_data_persist_state=5;__atomic_fetch_add(&native_data_persist_errors,1,__ATOMIC_RELAXED);
+      if (!requestStage) {
+        actual = 0;
+        noMemory = true;
+      } else {
+        DirectOverlay concurrent = {this, requestStage + kStagePages * persist::kBlock,
+                                    overlay.pages, overlay.active, overlay.readOnly};
+        if (write && __atomic_load_n(&directFailed, __ATOMIC_ACQUIRE)) {
+          actual = 0;
+        } else {
+          actual = isBig ? directDiskIO(big, concurrent, store, requestStage, kStagePages, write, block * 512, bytes, bops, &storeError)
+                         : directDiskIO(sparse, concurrent, store, requestStage, kStagePages, write, block * 512, bytes, bops, &storeError);
+        }
+        IOFree(requestStage, (kStagePages + 1) * persist::kBlock);
       }
-      if(write && actual){__atomic_fetch_add(&native_data_persist_writes,(actual+4095)/4096,__ATOMIC_RELAXED);__atomic_fetch_add(&native_data_persist_syncs,1,__ATOMIC_RELAXED);native_data_persist_present=overlay.present;}
+      if(storeError){
+        if (write) {
+          __atomic_store_n(&directFailed, true, __ATOMIC_RELEASE);
+        }
+        __atomic_store_n(&native_data_persist_state, 5U, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED);
+      }
+      if (write && actual) {
+        __atomic_fetch_add(&native_data_persist_writes, (actual + 4095) / 4096, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_data_persist_syncs, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&native_data_persist_present, __atomic_load_n(&overlay.present, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+      }
     } else {
     actual=ramSparseIO(sparse,write,block*512,bytes,ops,noMemory);
     }
@@ -329,7 +688,7 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     }
     if(write)__atomic_fetch_add(&native_ram_block_writes,1,__ATOMIC_RELAXED);
     else __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
-    native_ram_block_resident_bytes=isBig?big.resident:sparse.resident;
+    __atomic_store_n(&native_ram_block_resident_bytes, isBig ? big.resident : sparse.resident, __ATOMIC_RELAXED);
   }else if (buffer->getDirection() == kIODirectionIn) {
     actual = buffer->writeBytes(0, memory + block * 512, bytes);
     __atomic_fetch_add(&native_ram_block_reads, 1, __ATOMIC_RELAXED);
@@ -338,15 +697,29 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     __atomic_fetch_add(&native_ram_block_writes, 1, __ATOMIC_RELAXED);
   }
   IOReturn status = actual == bytes ? kIOReturnSuccess : noMemory ? kIOReturnNoMemory : kIOReturnIOError;
+  __atomic_fetch_add(buffer->getDirection() == kIODirectionOut ? &dataStats.writeBytes : &dataStats.readBytes,
+                     actual, __ATOMIC_RELAXED);
   if (status) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
-  IOLockUnlock(gate);
+  if (gateHeld) {
+    IOLockUnlock(gate);
+  }
+  releaseRange(range);
   completion->action(completion->target, completion->parameter, status, actual);
+  release();
   return kIOReturnSuccess;
 }
 
 void NativeRamBlock::stop(IOService *provider)
 {
-  if (gate) { IOLockLock(gate); online = false; IOLockUnlock(gate); }
+  if (gate) {
+    IOLockLock(gate);
+    online = false;
+    IOLockWakeup(gate, &ranges, false);
+    while (ranges) {
+      IOLockSleep(gate, &ranges, THREAD_UNINT);
+    }
+    IOLockUnlock(gate);
+  }
   IOBlockStorageDevice::stop(provider);
 }
 
@@ -361,6 +734,10 @@ void NativeRamBlock::free()
     big = {}; isBig = false;
   }
   if (gate) { IOLockFree(gate); gate = nullptr; }
+  if (bitmapGate) {
+    IOLockFree(bitmapGate);
+    bitmapGate = nullptr;
+  }
   if(sparse.pages){
     for(uint64_t i=0;i<sparse.bytes/4096;++i)if(sparse.pages[i])IOFree(sparse.pages[i],4096);
     IOFree(sparse.pages,(sparse.bytes/4096)*sizeof(uint8_t *));sparse={};
@@ -434,17 +811,30 @@ extern "C" int native_ram_block_gpu_addon(const uint8_t **data,uint64_t *bytes) 
   if(!data || !bytes)return 0;
   *data=nullptr;*bytes=0;
   IORegistryEntry *map=IORegistryEntry::fromPath("/chosen/memory-map",gIODTPlane);
-  if(!map)return 0;
+  if(!map) {
+    IOLog("T733 addon: memory-map missing\n");
+    return 0;
+  }
   OSData *range=OSDynamicCast(OSData,map->getProperty("GpuAddon"));
   uint64_t physical=0,size=0;
+  unsigned rangeBytes = range ? range->getLength() : 0;
   if(range && range->getLength()==16){
     memcpy(&physical,range->getBytesNoCopy(),8);
     memcpy(&size,static_cast<const uint8_t *>(range->getBytesNoCopy())+8,8);
   }
   map->release();
-  if(!size || size>(UINT64_C(64)<<20) || (physical&4095) || physical<gPhysBase || size>gPhysSize || physical-gPhysBase>gPhysSize-size)return 0;
+  IOLog("T733 addon: range_bytes=%u physical=%llx bytes=%llu RAM=%llx+%llx\n",
+      rangeBytes, (unsigned long long)physical, (unsigned long long)size,
+      (unsigned long long)gPhysBase, (unsigned long long)gPhysSize);
+  if(!size || size>(UINT64_C(64)<<20) || (physical&4095) || physical<gPhysBase || size>gPhysSize || physical-gPhysBase>gPhysSize-size) {
+    IOLog("T733 addon: range rejected\n");
+    return 0;
+  }
   *data=reinterpret_cast<const uint8_t *>(ml_static_ptovirt(physical));
-  if(!*data)return 0;
+  if(!*data) {
+    IOLog("T733 addon: physical mapping unavailable\n");
+    return 0;
+  }
   *bytes=size;
   return 1;
 }
